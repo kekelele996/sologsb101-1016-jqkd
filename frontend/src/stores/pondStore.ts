@@ -10,7 +10,10 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { PatrolSheet } from '../types/patrol';
+import type { FlowOrder } from '../types/flow';
 import { DB_SCHEMA_VERSION, ROW_REVISION, countAll, db, initDatabase, putPond, removePond } from '../utils/db';
+import { patrolStatusOf } from '../utils/handoff';
 import { effectiveVerdict, pondVolumeM3 } from '../utils/brine';
 import { nowIso, uuid } from '../utils/id';
 
@@ -37,6 +40,12 @@ export interface PondStat {
   dischargeReady: boolean;
   /** 走水计划条数 */
   scheduleCount: number;
+  /** 巡测单条数 */
+  patrolCount: number;
+  /** 最近一张巡测单是否到指标（无巡测单为 false） */
+  patrolReady: boolean;
+  /** 提锂车间走水编排单条数 */
+  flowOrderCount: number;
 }
 
 interface PondState {
@@ -45,6 +54,8 @@ interface PondState {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  patrolSheets: PatrolSheet[];
+  flowOrders: FlowOrder[];
   currentSeries: string | null;
   loading: boolean;
   ready: boolean;
@@ -78,6 +89,8 @@ function createPondStore() {
     observations: [],
     assays: [],
     schedules: [],
+    patrolSheets: [],
+    flowOrders: [],
     currentSeries: readSeries(),
     loading: true,
     ready: false,
@@ -100,16 +113,18 @@ function createPondStore() {
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [ponds, gates, observations, assays, schedules] = await Promise.all([
+          const [ponds, gates, observations, assays, schedules, patrolSheets, flowOrders] = await Promise.all([
             db.ponds.toArray(),
             db.gates.toArray(),
             db.observations.toArray(),
             db.assays.toArray(),
             db.schedules.toArray(),
+            db.patrolSheets.toArray(),
+            db.flowOrders.toArray(),
           ]);
-          return { ponds, gates, observations, assays, schedules };
+          return { ponds, gates, observations, assays, schedules, patrolSheets, flowOrders };
         }).subscribe({
-          next: ({ ponds, gates, observations, assays, schedules }) => {
+          next: ({ ponds, gates, observations, assays, schedules, patrolSheets, flowOrders }) => {
             const sorted = [...ponds].sort(
               (a, b) => a.seriesName.localeCompare(b.seriesName, 'zh-Hans-CN') || a.code.localeCompare(b.code),
             );
@@ -119,6 +134,8 @@ function createPondStore() {
               observations: [...observations].sort((a, b) => a.date.localeCompare(b.date)),
               assays: [...assays].sort((a, b) => a.date.localeCompare(b.date)),
               schedules: [...schedules].sort((a, b) => a.orderIndex - b.orderIndex),
+              patrolSheets,
+              flowOrders,
               loading: false,
               ready: true,
               error: '',
@@ -156,6 +173,10 @@ function createPondStore() {
         .sort((a, b) => a.date.localeCompare(b.date));
       const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
       const verdict = latestAssay === null ? '—' : effectiveVerdict(latestAssay);
+      const pondPatrol = state.patrolSheets
+        .filter((row) => row.pondId === pond.id)
+        .sort((a, b) => a.date.localeCompare(b.date) || a.shift.localeCompare(b.shift, 'zh-Hans-CN'));
+      const latestPatrol = pondPatrol.length > 0 ? pondPatrol[pondPatrol.length - 1] : null;
       result[pond.id] = {
         pondId: pond.id,
         lastObservationDate: latestObs === null ? '' : latestObs.date,
@@ -168,6 +189,9 @@ function createPondStore() {
         lastVerdict: verdict,
         dischargeReady: verdict === '达标',
         scheduleCount: state.schedules.filter((row) => row.pondId === pond.id).length,
+        patrolCount: pondPatrol.length,
+        patrolReady: latestPatrol === null ? false : patrolStatusOf(latestPatrol, pond.stage) === '到指标',
+        flowOrderCount: state.flowOrders.filter((row) => row.pondId === pond.id).length,
       };
     });
     return result;
@@ -187,6 +211,9 @@ function createPondStore() {
         lastVerdict: '—',
         dischargeReady: false,
         scheduleCount: 0,
+        patrolCount: 0,
+        patrolReady: false,
+        flowOrderCount: 0,
       }
     );
   }

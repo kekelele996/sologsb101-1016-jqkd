@@ -8,7 +8,8 @@
     "dev": "vite --host --port 22816",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host --port 22816",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:handoff": "node scripts/run-handoff-tests.mjs"
   },
   "dependencies": {
     "@solidjs/router": "^0.15.1",

@@ -8,6 +8,9 @@ import type { Pond } from '../types/pond';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { PatrolSheet } from '../types/patrol';
+import type { BrineTank, FlowOrder } from '../types/flow';
+import { patrolStatusOf, tankFreeM3 } from './handoff';
 import { effectiveVerdict, pondVolumeM3, round1 } from './brine';
 import { stampSuffix } from './id';
 
@@ -135,6 +138,74 @@ export function exportProgressCsvFile(
   const filename = `盐湖晒程进度汇总-${stampSuffix()}.csv`;
   download(filename, buildProgressCsv(ponds, observations, assays, schedules), 'text/csv;charset=utf-8');
   return filename;
+}
+
+/** 巡测班巡测单 CSV：按池号 + 班次导出当班密度 / 水位 / 风力与指标判定 */
+export function buildPatrolCsv(ponds: Pond[], sheets: PatrolSheet[]): string {
+  const stageOf = new Map(ponds.map((pond) => [pond.id, pond.stage]));
+  const codeOf = new Map(ponds.map((pond) => [pond.id, pond.code]));
+  const seriesOf = new Map(ponds.map((pond) => [pond.id, pond.seriesName]));
+  const header = ['池号', '池系', '阶段', '日期', '班次', '密度(g/cm³)', '水位(cm)', '风力等级', '当班指标', '记录人', '升级补班次', '备注'];
+  const lines: string[] = [header.map(csvCell).join(',')];
+  [...sheets]
+    .sort((a, b) => a.date.localeCompare(b.date) || a.shift.localeCompare(b.shift, 'zh-Hans-CN'))
+    .forEach((sheet) => {
+      const stage = stageOf.get(sheet.pondId);
+      const status = stage === undefined ? '未到指标' : patrolStatusOf(sheet, stage);
+      lines.push(
+        [
+          codeOf.get(sheet.pondId) ?? sheet.pondId,
+          seriesOf.get(sheet.pondId) ?? '',
+          stage ?? '',
+          sheet.date,
+          sheet.shift,
+          sheet.densityGcm3,
+          sheet.levelCm,
+          sheet.windLevel,
+          status,
+          sheet.recorder,
+          sheet.shiftBackfilled ? '待核' : '',
+          sheet.note,
+        ]
+          .map(csvCell)
+          .join(','),
+      );
+    });
+  return `﻿${lines.join('\n')}`;
+}
+
+/** 提锂车间走水编排单 CSV：串级走向、班次对账状态、排队与入罐情况 */
+export function buildFlowOrdersCsv(orders: FlowOrder[], ponds: Pond[], tank: BrineTank | null): string {
+  const codeOf = new Map(ponds.map((pond) => [pond.id, pond.code]));
+  const seriesOf = new Map(ponds.map((pond) => [pond.id, pond.seriesName]));
+  const header = ['池号', '池系', '日期', '班次', '串级走向', '计划量(m³)', '已入罐(m³)', '状态', '排队原因', '原排队班次', '调度员'];
+  const lines: string[] = [header.map(csvCell).join(',')];
+  [...orders]
+    .sort((a, b) => a.planDate.localeCompare(b.planDate) || a.shift.localeCompare(b.shift, 'zh-Hans-CN') || a.orderIndex - b.orderIndex)
+    .forEach((order) => {
+      lines.push(
+        [
+          codeOf.get(order.pondId) ?? order.pondId,
+          seriesOf.get(order.pondId) ?? '',
+          order.planDate,
+          order.shift,
+          order.cascadePath,
+          order.volumeM3,
+          order.deliveredM3,
+          order.state,
+          order.queueReason,
+          order.queuedFromDate === '' ? '' : `${order.queuedFromDate} ${order.queuedFromShift}`,
+          order.operator,
+        ]
+          .map(csvCell)
+          .join(','),
+      );
+    });
+  if (tank !== null) {
+    lines.push('');
+    lines.push(['成品卤罐', tank.name, `总容量(m³)`, tank.capacityM3, `存量(m³)`, tank.occupiedM3, `剩余(m³)`, tankFreeM3(tank)].map(csvCell).join(','));
+  }
+  return `﻿${lines.join('\n')}`;
 }
 
 /** 复制文本到剪贴板 */

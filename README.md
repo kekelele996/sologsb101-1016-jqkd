@@ -41,7 +41,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 路由 | @solidjs/router 0.15 | `Router root={App}` 布局路由，全部路径支持深链刷新 |
 | 状态管理 | Solid 原生能力 | `createStore`（pondStore / scheduleStore）+ `createSignal`（observationStore），**不使用 Pinia / Zustand** |
 | UI | Tailwind CSS 3.4 | 全部界面手写 Tailwind，**不使用 Element Plus / Ant Design / Vue / React** |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm` 并迁移旧记录 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm`；`v2 → v3` 新增巡测班/提锂车间三张表并给旧巡测数据按池号补班次 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -89,7 +89,9 @@ sologsb101-1016/
 | `/observations` | `pages/ObservationEntry.tsx` | 卤水日观测录入台：单条 + 批量粘贴录入，同池同日覆盖写入，蒸发量按经验公式自动估算 |
 | `/assays` | `pages/AssayEntry.tsx` | 离子组分分析：Li⁺/K⁺/Mg²⁺/Na⁺ 录入、自动达标判定（可人工覆盖）、SVG 组分曲线 |
 | `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段 |
-| `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、重置演示数据 |
+| `/patrols` | `pages/PatrolBoard.tsx` | 巡测班巡测单：按池号 + 白/中/夜班次记录当班密度、水位、风力，实时判定到指标/未到指标，升级补班次的记录单列待核 |
+| `/workshop` | `pages/FlowBoard.tsx` | 提锂车间：池系串级走向、走水编排单与成品卤罐；按池号+班次与巡测班对账，未到指标挂起，罐满排队到下一班，罐位空出本侧接着排 |
+| `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV（进度/巡测单/编排单）、重置演示数据 |
 
 `/` 重定向到 `/ponds`，未匹配路径统一回落到 `/ponds`。
 **全部路由支持直接深链**：把 `http://localhost:22816/schedules` 或 `http://localhost:22816/assays` 直接粘贴到地址栏刷新即可打开；
@@ -101,11 +103,15 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**新增班次制两张台账 + 成品卤罐** ——
+    `patrolSheets`（`[pondId+date+shift]` 复合索引）、`flowOrders`、`brineTanks`；
+    `.upgrade()` 里对旧巡测数据**按池号补默认班次（白班）**，班次原值对不上的记录置 `shiftBackfilled=true`
+    并在备注加「班次待核」单列，交人工核对。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,6 +121,9 @@ sologsb101-1016/
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
   | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `patrolSheets` | id | pondId, date, shift, **[pondId+date+shift]**, shiftBackfilled |
+  | `flowOrders` | id | pondId, planDate, shift, state, orderIndex |
+  | `brineTanks` | id | name |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -123,9 +132,10 @@ sologsb101-1016/
   * 16 条卤水日观测（每池 2–4 条，密度随日期递增，`evapMm` 由经验公式生成）；
   * 6 条离子组分分析（覆盖达标 / 接近 / 未达标，其中 1 条为人工覆盖判定）；
   * 5 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态）。
+  * 6 张巡测班巡测单（白/中/夜班，覆盖到指标/未到指标）、5 张提锂车间走水编排单（挂起 / 排队中 / 已排 / 走水中 / 已入罐）、1 座成品卤罐固定 id `brine-tank-main`。
   * 固定 id 如 `pond-north-01`、`pond-south-04` 可直接用于验证与二次开发。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的池系」这一界面偏好，不存业务数据。
-* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验与走水编排（同一 Dexie 事务内完成）。
+* 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验、走水计划以及巡测单与编排单（同一 Dexie 事务内完成）。
 
 ---
 
@@ -157,3 +167,9 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+* **巡测班 × 提锂车间交接**（`src/utils/handoff.ts`，`npm run test:handoff` 自测）：
+  * 巡测班按「池号 + 日期 + 班次（白/中/夜）」记巡测单，当班密度达到阶段指标（钠盐 1.10 / 钾盐 1.18 / 锂盐 1.24 g/cm³）且水位 ≥ 10 cm 才算「到指标」。
+  * 排下一段走水前两边**按池号 + 班次对账**：缺巡测单或未到指标的池，编排单置「挂起」先不排。
+  * 串级走向沿开启的闸门取最大开度主链路推导（`cascadeChainOf`），自动防环。
+  * **成品卤罐满时走水排队到下一班**（白→中→夜→次日白），且要求下一班同样有到指标巡测单；**罐位空出后由提锂车间本侧**从排队单中取最早、装得下的单子接着排，恢复到原排队班次。
+  * 入罐存量封顶不超容量，完成入罐回写 `deliveredM3`。

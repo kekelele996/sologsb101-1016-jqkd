@@ -3,13 +3,16 @@
  * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排
  * 所有 id 固定，保证 /gates、/observations、/assays、/schedules 打开就有真实串级与数据。
  */
-import { db, ROW_REVISION } from './db';
+import { db, ROW_REVISION, BRINE_TANK_ID } from './db';
 import type { Pond } from '../types/pond';
 import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { PatrolSheet } from '../types/patrol';
+import type { BrineTank, FlowOrder } from '../types/flow';
 import { autoVerdict, estimateEvapMm } from './brine';
+import { cascadePathText } from './handoff';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
 
@@ -137,11 +140,63 @@ export async function seedDatabase(): Promise<void> {
     wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await db.ponds.bulkPut(ponds);
-    await db.gates.bulkPut(gates);
-    await db.observations.bulkPut(observations);
-    await db.assays.bulkPut(assays);
-    await db.schedules.bulkPut(schedules);
-  });
+  // ---------------- 巡测班：当班巡测单（按池号 + 班次，覆盖到指标 / 未到指标） ----------------
+  const patrolSheets: PatrolSheet[] = [
+    wrap<PatrolSheet>({ id: 'patrol-a-d1', pondId: SEED_IDS.pondA, date: '2026-10-02', shift: '白班', densityGcm3: 1.112, levelCm: 39, windLevel: 3, recorder: '周巡', note: '钠盐池已晒成，等排', shiftBackfilled: false }),
+    wrap<PatrolSheet>({ id: 'patrol-d-d1', pondId: SEED_IDS.pondD, date: '2026-10-04', shift: '中班', densityGcm3: 1.092, levelCm: 44, windLevel: 3, recorder: '吴巡', note: '密度差一点，先挂着', shiftBackfilled: false }),
+    wrap<PatrolSheet>({ id: 'patrol-b-d1', pondId: SEED_IDS.pondB, date: '2026-10-06', shift: '白班', densityGcm3: 1.176, levelCm: 36, windLevel: 2, recorder: '周巡', note: '', shiftBackfilled: false }),
+    wrap<PatrolSheet>({ id: 'patrol-c-d1', pondId: SEED_IDS.pondC, date: '2026-10-05', shift: '夜班', densityGcm3: 1.25, levelCm: 30, windLevel: 2, recorder: '郑巡', note: '锂盐老卤到指标', shiftBackfilled: false }),
+    wrap<PatrolSheet>({ id: 'patrol-c-d2', pondId: SEED_IDS.pondC, date: '2026-10-06', shift: '白班', densityGcm3: 1.252, levelCm: 30, windLevel: 1, recorder: '郑巡', note: '', shiftBackfilled: false }),
+    wrap<PatrolSheet>({ id: 'patrol-e-d1', pondId: SEED_IDS.pondE, date: '2026-09-28', shift: '中班', densityGcm3: 1.146, levelCm: 36, windLevel: 2, recorder: '吴巡', note: '清池前最后一班', shiftBackfilled: false }),
+  ];
+
+  // ---------------- 提锂车间：走水编排单（挂起 / 排队中 / 已排 / 走水中 / 已入罐） ----------------
+  const flowOrders: FlowOrder[] = [
+    wrap<FlowOrder>({
+      id: 'flow-a-1002d', pondId: SEED_IDS.pondA, cascadePath: cascadePathText(gates, ponds, SEED_IDS.pondA),
+      planDate: '2026-10-02', shift: '白班', volumeM3: 1200, operator: '韩江', state: '已排',
+      queueReason: '', queuedFromDate: '', queuedFromShift: '', deliveredM3: 0, orderIndex: 1,
+    }),
+    wrap<FlowOrder>({
+      id: 'flow-d-1004m', pondId: SEED_IDS.pondD, cascadePath: cascadePathText(gates, ponds, SEED_IDS.pondD),
+      planDate: '2026-10-04', shift: '中班', volumeM3: 1600, operator: '王锐', state: '挂起',
+      queueReason: '', queuedFromDate: '', queuedFromShift: '', deliveredM3: 0, orderIndex: 2,
+    }),
+    wrap<FlowOrder>({
+      id: 'flow-b-1006d', pondId: SEED_IDS.pondB, cascadePath: cascadePathText(gates, ponds, SEED_IDS.pondB),
+      planDate: '2026-10-06', shift: '白班', volumeM3: 900, operator: '韩江', state: '走水中',
+      queueReason: '', queuedFromDate: '', queuedFromShift: '', deliveredM3: 0, orderIndex: 3,
+    }),
+    wrap<FlowOrder>({
+      id: 'flow-c-1006d', pondId: SEED_IDS.pondC, cascadePath: cascadePathText(gates, ponds, SEED_IDS.pondC),
+      planDate: '2026-10-06', shift: '白班', volumeM3: 600, operator: '李文', state: '排队中',
+      queueReason: '成品卤罐容量满，排队到下一班', queuedFromDate: '2026-10-05', queuedFromShift: '夜班',
+      deliveredM3: 0, orderIndex: 4,
+    }),
+    wrap<FlowOrder>({
+      id: 'flow-e-0928m', pondId: SEED_IDS.pondE, cascadePath: cascadePathText(gates, ponds, SEED_IDS.pondE),
+      planDate: '2026-09-28', shift: '中班', volumeM3: 700, operator: '王锐', state: '已入罐',
+      queueReason: '', queuedFromDate: '', queuedFromShift: '', deliveredM3: 700, orderIndex: 5,
+    }),
+  ];
+
+  // ---------------- 成品卤罐（单例；演示为接近满罐，留出可继续排的空间） ----------------
+  const brineTanks: BrineTank[] = [
+    { id: BRINE_TANK_ID, name: '成品卤罐 1#', capacityM3: 2000, occupiedM3: 1500, updatedAt: SEED_TIME, revision: ROW_REVISION },
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.patrolSheets, db.flowOrders, db.brineTanks],
+    async () => {
+      await db.ponds.bulkPut(ponds);
+      await db.gates.bulkPut(gates);
+      await db.observations.bulkPut(observations);
+      await db.assays.bulkPut(assays);
+      await db.schedules.bulkPut(schedules);
+      await db.patrolSheets.bulkPut(patrolSheets);
+      await db.flowOrders.bulkPut(flowOrders);
+      await db.brineTanks.bulkPut(brineTanks);
+    },
+  );
 }

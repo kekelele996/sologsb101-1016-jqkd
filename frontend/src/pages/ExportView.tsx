@@ -6,10 +6,29 @@ import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
+import { useFlowStore } from '../stores/flowStore';
+import { usePatrolStore } from '../stores/patrolStore';
 import { usePondStore } from '../stores/pondStore';
 import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
-import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
+import {
+  buildBriefingText,
+  buildFlowOrdersCsv,
+  buildPatrolCsv,
+  copyText,
+  download,
+  exportProgressCsvFile,
+  exportSnapshotJson,
+  parseSnapshot,
+} from '../utils/export';
+import { stampSuffix } from '../utils/id';
 import { effectiveVerdict } from '../utils/brine';
+import { patrolStatusOf, tankFreeM3 } from '../utils/handoff';
+
+function exportCsvFile(label: string, content: string): string {
+  const filename = `${label}-${stampSuffix()}.csv`;
+  download(filename, content, 'text/csv;charset=utf-8');
+  return filename;
+}
 
 const BTN_GHOST =
   'rounded-md border border-slate-300 bg-white px-3.5 py-1.5 text-sm text-slate-700 transition hover:bg-slate-100';
@@ -17,6 +36,8 @@ const BTN_DANGER = 'rounded-md bg-rose-600 px-3.5 py-1.5 text-sm font-medium tex
 
 export default function ExportView() {
   const store = usePondStore();
+  const patrolStore = usePatrolStore();
+  const flowStore = useFlowStore();
   const [message, setMessage] = createSignal('');
   const [resetOpen, setResetOpen] = createSignal(false);
 
@@ -32,12 +53,25 @@ export default function ExportView() {
     const passCount = assays.filter((row) => effectiveVerdict(row) === '达标').length;
     const done = schedules.filter((row) => row.state === '已出卤').length;
     const readyPonds = new Set(assays.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
+    const stageOf = new Map(ponds.map((pond) => [pond.id, pond.stage]));
+    const patrolReady = patrolStore.state.rows.filter(
+      (row) => (stageOf.get(row.pondId) ? patrolStatusOf(row, stageOf.get(row.pondId)!) : '未到指标') === '到指标',
+    ).length;
+    const tank = flowStore.state.tank;
     return {
       ponds: ponds.length,
       observations: observations.length,
       assays: assays.length,
       gates: store.state.gates.length,
       schedules: schedules.length,
+      patrols: patrolStore.state.rows.length,
+      patrolReady,
+      backfilled: patrolStore.state.rows.filter((row) => row.shiftBackfilled).length,
+      flowOrders: flowStore.state.rows.length,
+      queued: flowStore.state.rows.filter((row) => row.state === '排队中').length,
+      delivered: flowStore.state.rows.filter((row) => row.state === '已入罐').length,
+      tankOccupied: tank.occupiedM3,
+      tankFree: tankFreeM3(tank),
       passCount,
       passPct: assays.length === 0 ? 0 : Math.round((passCount / assays.length) * 1000) / 10,
       donePct: schedules.length === 0 ? 0 : Math.round((done / schedules.length) * 1000) / 10,
@@ -59,6 +93,19 @@ export default function ExportView() {
       store.state.schedules,
     );
     setMessage(`已导出晒程进度汇总 ${filename}`);
+  };
+
+  const handleExportPatrolCsv = (): void => {
+    const filename = exportCsvFile('巡测班巡测单', buildPatrolCsv(store.state.ponds, patrolStore.state.rows));
+    setMessage(`已导出${filename}`);
+  };
+
+  const handleExportFlowCsv = (): void => {
+    const filename = exportCsvFile(
+      '提锂车间走水编排单',
+      buildFlowOrdersCsv(flowStore.state.rows, store.state.ponds, flowStore.state.tank),
+    );
+    setMessage(`已导出${filename}`);
   };
 
   const handleCopyBriefing = async (): Promise<void> => {
@@ -108,12 +155,16 @@ export default function ExportView() {
         />
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
+        <StatBadge label="巡测单" value={summary().patrols} suffix="张" tone="info" />
+        <StatBadge label="当班到指标" value={summary().patrolReady} suffix="池" tone="success" />
+        <StatBadge label="编排单排队中" value={summary().queued} suffix="张" tone="warning" />
+        <StatBadge label="成品卤罐剩余" value={summary().tankFree} suffix="m³" tone="info" />
         <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="v1 建表；v2 新增 evapMm；v3 新增巡测单/编排单/成品卤罐并按池号给旧巡测数据补班次"
         />
       </div>
 
@@ -130,6 +181,12 @@ export default function ExportView() {
             </button>
             <button class={BTN_GHOST} onClick={handleExportCsv}>
               导出 CSV 汇总
+            </button>
+            <button class={BTN_GHOST} onClick={handleExportPatrolCsv}>
+              导出巡测单 CSV
+            </button>
+            <button class={BTN_GHOST} onClick={handleExportFlowCsv}>
+              导出编排单 CSV
             </button>
             <button class={BTN_GHOST} onClick={() => void handleCopyBriefing()}>
               复制调度通报
@@ -231,7 +288,7 @@ export default function ExportView() {
           <div class="w-full max-w-lg rounded-xl bg-white shadow-2xl">
             <div class="border-b border-slate-200 px-4 py-3 text-sm font-semibold text-slate-800">确认重置本地数据？</div>
             <div class="px-4 py-4 text-sm leading-relaxed text-slate-600">
-              全部蒸发池、闸门串级、卤水日观测、离子组分分析与走水编排都会被清空，并重新灌入演示数据。
+              全部蒸发池、闸门串级、卤水日观测、离子组分分析、走水编排，以及巡测班巡测单、提锂车间走水编排单与成品卤罐台账都会被清空，并重新灌入演示数据。
             </div>
             <div class="flex justify-end gap-2 border-t border-slate-200 px-4 py-3">
               <button class={BTN_GHOST} onClick={() => setResetOpen(false)}>

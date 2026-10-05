@@ -3,6 +3,8 @@
  * - 数据库名：gbbrinepond
  * - v1：建立全部表与 pondId+date 复合索引
  * - v2：新增 evapMm 字段并写入升级迁移逻辑，旧记录自动补齐默认值
+ * - v3：新增巡测班（patrolSheets）、提锂车间走水编排单（flowOrders）、成品卤罐（brineTanks）；
+ *       旧巡测数据没写班次，按池号补班次，对不上的单列。
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie';
@@ -11,7 +13,10 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule, ScheduleState } from '../types/schedule';
+import type { PatrolSheet } from '../types/patrol';
+import type { BrineTank, FlowOrder } from '../types/flow';
 import { estimateEvapMm } from './brine';
+import { resolveShift } from './handoff';
 import { nowIso } from './id';
 import { seedDatabase } from './seed';
 
@@ -19,10 +24,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class BrinePondDatabase extends Dexie {
   ponds!: Table<Pond, string>;
@@ -30,6 +35,9 @@ class BrinePondDatabase extends Dexie {
   observations!: Table<Observation, string>;
   assays!: Table<Assay, string>;
   schedules!: Table<Schedule, string>;
+  patrolSheets!: Table<PatrolSheet, string>;
+  flowOrders!: Table<FlowOrder, string>;
+  brineTanks!: Table<BrineTank, string>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +52,7 @@ class BrinePondDatabase extends Dexie {
     });
 
     // ---------- v2：新增 evapMm 字段，并为旧记录补齐默认值 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
         gates: 'id, fromPondId, toPondId, state, openingPct',
@@ -90,6 +98,57 @@ class BrinePondDatabase extends Dexie {
           }
         });
       });
+
+    // ---------- v3：巡测班 / 提锂车间（班次制走水对账 + 成品卤罐） ----------
+    // patrolSheets / flowOrders 都按「池号 + 日期 + 班次」对账，用三键复合索引保证同池同班只一条巡测单。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, planDate, state, orderIndex',
+        patrolSheets: 'id, pondId, date, shift, [pondId+date+shift], shiftBackfilled',
+        flowOrders: 'id, pondId, planDate, shift, state, orderIndex',
+        brineTanks: 'id, name',
+      })
+      .upgrade(async (tx) => {
+        // 旧巡测数据没写班次：升级时按池号补默认班次（白班）；原值对不上的单列，
+        // shiftBackfilled=true 且备注加「班次待核」，交人工核对，不静默吞掉。
+        // 兼容历史上可能以 patrols / patrolSheets 两种表名落地的数据。
+        const existingNames = new Set(db.tables.map((table) => table.name));
+        const patrolTableNames = ['patrolSheets', 'patrols'].filter((name) => existingNames.has(name));
+        for (const name of patrolTableNames) {
+          await tx.table(name).toCollection().modify((row: Record<string, unknown>) => {
+            const { value, matched } = resolveShift(row.shift);
+            row.shift = value;
+            row.shiftBackfilled = true;
+            if (!matched) {
+              const note = typeof row.note === 'string' ? row.note : '';
+              row.note = note.includes('班次待核') ? note : `${note}【班次待核：旧值对不上，已单列】`.trim();
+            }
+            if (typeof row.recorder !== 'string') row.recorder = '';
+            if (typeof row.note !== 'string') row.note = '';
+            row.revision = ROW_REVISION;
+            if (typeof row.createdAt !== 'string') row.createdAt = nowIso();
+            if (typeof row.updatedAt !== 'string') row.updatedAt = row.createdAt;
+          });
+        }
+        // 编排单补齐排队 / 入罐相关字段
+        if (existingNames.has('flowOrders')) {
+          await tx.table('flowOrders').toCollection().modify((row: Record<string, unknown>) => {
+            if (typeof row.cascadePath !== 'string') row.cascadePath = '';
+            if (typeof row.queueReason !== 'string') row.queueReason = '';
+            if (typeof row.queuedFromDate !== 'string') row.queuedFromDate = '';
+            if (typeof row.queuedFromShift !== 'string') row.queuedFromShift = '';
+            if (typeof row.deliveredM3 !== 'number') row.deliveredM3 = 0;
+            if (typeof row.orderIndex !== 'number') row.orderIndex = 1;
+            row.revision = ROW_REVISION;
+            if (typeof row.createdAt !== 'string') row.createdAt = nowIso();
+            if (typeof row.updatedAt !== 'string') row.updatedAt = row.createdAt;
+          });
+        }
+      });
   }
 }
 
@@ -127,17 +186,23 @@ export async function putPond(row: Pond): Promise<void> {
   await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
 }
 
-/** 删除蒸发池，并级联清理相关闸门、观测、化验与走水计划 */
+/** 删除蒸发池，并级联清理相关闸门、观测、化验、走水计划与班次台账 */
 export async function removePond(id: string): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    const gates = await db.gates.toArray();
-    const related = gates.filter((gate) => gate.fromPondId === id || gate.toPondId === id).map((gate) => gate.id);
-    if (related.length > 0) await db.gates.bulkDelete(related);
-    await db.observations.where('pondId').equals(id).delete();
-    await db.assays.where('pondId').equals(id).delete();
-    await db.schedules.where('pondId').equals(id).delete();
-    await db.ponds.delete(id);
-  });
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.patrolSheets, db.flowOrders],
+    async () => {
+      const gates = await db.gates.toArray();
+      const related = gates.filter((gate) => gate.fromPondId === id || gate.toPondId === id).map((gate) => gate.id);
+      if (related.length > 0) await db.gates.bulkDelete(related);
+      await db.observations.where('pondId').equals(id).delete();
+      await db.assays.where('pondId').equals(id).delete();
+      await db.schedules.where('pondId').equals(id).delete();
+      await db.patrolSheets.where('pondId').equals(id).delete();
+      await db.flowOrders.where('pondId').equals(id).delete();
+      await db.ponds.delete(id);
+    },
+  );
 }
 
 /* -------------------------------- 闸门 -------------------------------- */
@@ -274,6 +339,64 @@ export async function advanceScheduleState(scheduleId: string, next: ScheduleSta
   await db.schedules.update(scheduleId, { state: next, updatedAt: nowIso() });
 }
 
+/* ---------------------------- 巡测班：巡测单 ---------------------------- */
+
+export async function listPatrolSheets(): Promise<PatrolSheet[]> {
+  const rows = await db.patrolSheets.toArray();
+  return rows.sort((a, b) => b.date.localeCompare(a.date) || b.shift.localeCompare(a.shift));
+}
+
+/**
+ * 写入巡测单：同池同日期同班次仅保留一条（存在即覆盖原记录）。
+ * 旧数据升级时按池号补班次；正常录入不视为补齐，shiftBackfilled=false。
+ */
+export async function upsertPatrolSheet(row: PatrolSheet): Promise<PatrolSheet> {
+  const existing = await db.patrolSheets
+    .where('[pondId+date+shift]')
+    .equals([row.pondId, row.date, row.shift])
+    .first();
+  const next: PatrolSheet = {
+    ...row,
+    id: existing === undefined ? row.id : existing.id,
+    shiftBackfilled: existing === undefined ? row.shiftBackfilled : existing.shiftBackfilled,
+    createdAt: existing === undefined ? row.createdAt : existing.createdAt,
+    updatedAt: nowIso(),
+    revision: ROW_REVISION,
+  };
+  await db.patrolSheets.put(next);
+  return next;
+}
+
+export async function removePatrolSheet(id: string): Promise<void> {
+  await db.patrolSheets.delete(id);
+}
+
+/* --------------------- 提锂车间：走水编排单 + 成品卤罐 --------------------- */
+
+export async function listFlowOrders(): Promise<FlowOrder[]> {
+  const rows = await db.flowOrders.toArray();
+  return rows.sort((a, b) => a.orderIndex - b.orderIndex || a.planDate.localeCompare(b.planDate));
+}
+
+export async function putFlowOrder(row: FlowOrder): Promise<void> {
+  await db.flowOrders.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeFlowOrder(id: string): Promise<void> {
+  await db.flowOrders.delete(id);
+}
+
+/** 成品卤罐固定为单例台账 */
+export const BRINE_TANK_ID = 'brine-tank-main';
+
+export async function getBrineTank(): Promise<BrineTank | undefined> {
+  return db.brineTanks.get(BRINE_TANK_ID);
+}
+
+export async function putBrineTank(tank: BrineTank): Promise<void> {
+  await db.brineTanks.put({ ...tank, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
 /* ---------------------------- 整库快照 ---------------------------- */
 
 export interface DatabaseSnapshot {
@@ -285,56 +408,94 @@ export interface DatabaseSnapshot {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  patrolSheets: PatrolSheet[];
+  flowOrders: FlowOrder[];
+  brineTanks: BrineTank[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, patrolSheets, flowOrders, brineTanks] = await Promise.all([
     db.ponds.toArray(),
     db.gates.toArray(),
     db.observations.toArray(),
     db.assays.toArray(),
     db.schedules.toArray(),
+    db.patrolSheets.toArray(),
+    db.flowOrders.toArray(),
+    db.brineTanks.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), ponds, gates, observations, assays, schedules };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    ponds,
+    gates,
+    observations,
+    assays,
+    schedules,
+    patrolSheets,
+    flowOrders,
+    brineTanks,
+  };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await Promise.all([
-      db.ponds.clear(),
-      db.gates.clear(),
-      db.observations.clear(),
-      db.assays.clear(),
-      db.schedules.clear(),
-    ]);
-    await db.ponds.bulkPut(snapshot.ponds.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.gates.bulkPut(snapshot.gates.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.schedules.bulkPut(snapshot.schedules.map((row) => ({ ...row, revision: ROW_REVISION })));
-  });
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.patrolSheets, db.flowOrders, db.brineTanks],
+    async () => {
+      await Promise.all([
+        db.ponds.clear(),
+        db.gates.clear(),
+        db.observations.clear(),
+        db.assays.clear(),
+        db.schedules.clear(),
+        db.patrolSheets.clear(),
+        db.flowOrders.clear(),
+        db.brineTanks.clear(),
+      ]);
+      await db.ponds.bulkPut(snapshot.ponds.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.gates.bulkPut(snapshot.gates.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.schedules.bulkPut(snapshot.schedules.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.patrolSheets.bulkPut((snapshot.patrolSheets ?? []).map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.flowOrders.bulkPut((snapshot.flowOrders ?? []).map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.brineTanks.bulkPut((snapshot.brineTanks ?? []).map((row) => ({ ...row, revision: ROW_REVISION })));
+    },
+  );
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await Promise.all([
-      db.ponds.clear(),
-      db.gates.clear(),
-      db.observations.clear(),
-      db.assays.clear(),
-      db.schedules.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.patrolSheets, db.flowOrders, db.brineTanks],
+    async () => {
+      await Promise.all([
+        db.ponds.clear(),
+        db.gates.clear(),
+        db.observations.clear(),
+        db.assays.clear(),
+        db.schedules.clear(),
+        db.patrolSheets.clear(),
+        db.flowOrders.clear(),
+        db.brineTanks.clear(),
+      ]);
+    },
+  );
   await seedDatabase();
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, patrolSheets, flowOrders, brineTanks] = await Promise.all([
     db.ponds.count(),
     db.gates.count(),
     db.observations.count(),
     db.assays.count(),
     db.schedules.count(),
+    db.patrolSheets.count(),
+    db.flowOrders.count(),
+    db.brineTanks.count(),
   ]);
-  return { ponds, gates, observations, assays, schedules };
+  return { ponds, gates, observations, assays, schedules, patrolSheets, flowOrders, brineTanks };
 }
