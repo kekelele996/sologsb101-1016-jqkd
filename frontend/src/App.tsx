@@ -6,13 +6,9 @@ import { For, Show, onMount } from 'solid-js';
 import { A, type RouteSectionProps } from '@solidjs/router';
 import { NAV_ITEMS } from './router';
 import { usePondStore } from './stores/pondStore';
-import { useObservationStore } from './stores/observationStore';
-import { useScheduleStore } from './stores/scheduleStore';
 
 export default function App(props: RouteSectionProps) {
   const pondStore = usePondStore();
-  const observationStore = useObservationStore();
-  const scheduleStore = useScheduleStore();
 
   onMount(() => {
     void pondStore.loadAll();
@@ -24,6 +20,9 @@ export default function App(props: RouteSectionProps) {
     observations: pondStore.state.counts.observations ?? 0,
     assays: pondStore.state.counts.assays ?? 0,
     schedules: pondStore.state.counts.schedules ?? 0,
+    shifts: pondStore.state.counts.shifts ?? 0,
+    patrolSheets: pondStore.state.counts.patrolSheets ?? 0,
+    tanks: pondStore.state.counts.tanks ?? 0,
   });
 
   const currentSeries = () => pondStore.state.currentSeries ?? '全部池系';
@@ -37,7 +36,7 @@ export default function App(props: RouteSectionProps) {
           </span>
           <div>
             <h1 class="text-base font-semibold tracking-wide">盐湖蒸发池卤水晒程编排台</h1>
-            <p class="text-xs text-white/70">gbbrinepond · 串级走水 · 日观测 · 组分判定 · 出卤编排</p>
+            <p class="text-xs text-white/70">gbbrinepond · 串级走水 · 日观测 · 组分判定 · 出卤编排 · 巡测对账 · 卤罐排队</p>
           </div>
         </div>
         <div class="flex flex-wrap items-center gap-2 text-xs">
@@ -47,6 +46,9 @@ export default function App(props: RouteSectionProps) {
           <span class="rounded-full bg-white/15 px-2.5 py-1">观测 {counts().observations} 条</span>
           <span class="rounded-full bg-white/15 px-2.5 py-1">化验 {counts().assays} 条</span>
           <span class="rounded-full bg-white/15 px-2.5 py-1">走水 {counts().schedules} 条</span>
+          <span class="rounded-full bg-white/15 px-2.5 py-1">班次 {counts().shifts} 班</span>
+          <span class="rounded-full bg-white/15 px-2.5 py-1">巡测 {counts().patrolSheets} 条</span>
+          <span class="rounded-full bg-white/15 px-2.5 py-1">卤罐 {counts().tanks} 个</span>
         </div>
       </header>
 
@@ -71,8 +73,8 @@ export default function App(props: RouteSectionProps) {
 
           <div class="mt-4 hidden rounded-lg border border-slate-200 bg-white p-3 text-xs leading-relaxed text-slate-500 lg:block">
             <p class="mb-1 font-semibold text-slate-700">数据存储</p>
-            <p>库名 gbbrinepond（IndexedDB / Dexie），结构版本 v2。</p>
-            <p class="mt-1">v1 建表与 pondId+date 复合索引；v2 新增 evapMm 并迁移旧记录。</p>
+            <p>库名 gbbrinepond（IndexedDB / Dexie），结构版本 v3。</p>
+            <p class="mt-1">v1 建表与 pondId+date 复合索引；v2 新增 evapMm 并迁移旧记录；v3 新增班次 / 巡测单 / 成品卤罐，旧记录按池号补班次。</p>
           </div>
         </nav>
 
@@ -89,7 +91,7 @@ export default function App(props: RouteSectionProps) {
       <footer class="flex flex-wrap items-center justify-between gap-2 px-5 pb-6 pt-2 text-xs text-slate-400">
         <span>数据仅存于本浏览器（IndexedDB 库名 gbbrinepond / localStorage），不上传任何服务器。</span>
         <span>
-          观测 {observationStore.stats().count} 条 · 走水 {scheduleStore.state.rows.length} 条 · 结构版本 v
+          巡测 {pondStore.state.patrolSheets.length} 条 · 班次 {pondStore.state.shifts.length} 班 · 卤罐 {pondStore.state.tanks.length} 个 · 结构版本 v
           {pondStore.state.counts.schemaVersion ?? '-'}
         </span>
       </footer>

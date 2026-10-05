@@ -78,6 +78,7 @@ function createScheduleStore() {
     const row: Schedule = {
       id: uuid('schedule'),
       pondId: draft.pondId,
+      shiftId: draft.shiftId,
       planDate: draft.planDate,
       targetDensity: draft.targetDensity,
       volumeM3: draft.volumeM3,

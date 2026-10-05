@@ -15,6 +15,8 @@ export interface Schedule {
   id: string
   /** 所属蒸发池 */
   pondId: string
+  /** 所属班次（走水编排单按班次与巡测单对账） */
+  shiftId: string
   /** 计划走水日期 YYYY-MM-DD */
   planDate: string
   /** 目标密度（g/cm³） */
@@ -35,6 +37,7 @@ export interface Schedule {
 /** 新建 / 编辑走水编排的表单草稿 */
 export interface ScheduleDraft {
   pondId: string
+  shiftId: string
   planDate: string
   targetDensity: number
   volumeM3: number

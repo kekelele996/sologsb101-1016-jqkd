@@ -3,6 +3,7 @@
  * - 数据库名：gbbrinepond
  * - v1：建立全部表与 pondId+date 复合索引
  * - v2：新增 evapMm 字段并写入升级迁移逻辑，旧记录自动补齐默认值
+ * - v3：新增班次 / 巡测单 / 成品卤罐 / 升级补班次问题表，旧记录按池号补班次，对不上的单列
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie';
@@ -11,15 +12,19 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule, ScheduleState } from '../types/schedule';
+import type { Shift } from '../types/shift';
+import type { PatrolSheet } from '../types/patrolSheet';
+import type { FinishedBrineTank } from '../types/tank';
+import type { MigrationIssue } from '../types/migrationIssue';
 import { estimateEvapMm } from './brine';
-import { nowIso } from './id';
+import { nowIso, uuid } from './id';
 import { seedDatabase } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
 export const ROW_REVISION = 2;
@@ -30,6 +35,10 @@ class BrinePondDatabase extends Dexie {
   observations!: Table<Observation, string>;
   assays!: Table<Assay, string>;
   schedules!: Table<Schedule, string>;
+  shifts!: Table<Shift, string>;
+  patrolSheets!: Table<PatrolSheet, string>;
+  tanks!: Table<FinishedBrineTank, string>;
+  migrationIssues!: Table<MigrationIssue, string>;
 
   constructor() {
     super(DB_NAME);
@@ -90,6 +99,92 @@ class BrinePondDatabase extends Dexie {
           }
         });
       });
+
+    // ---------- v3：新增班次 / 巡测单 / 成品卤罐 / 升级补班次问题表 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, planDate, state, orderIndex, shiftId',
+        shifts: 'id, date, shiftType, [date+shiftType]',
+        patrolSheets: 'id, pondId, shiftId, [pondId+shiftId], densityGcm3',
+        tanks: 'id, code, status, pondId',
+        migrationIssues: 'id, kind, rowId, pondCode, date',
+      })
+      .upgrade(async (tx) => {
+        // 旧数据没写班次，升级时按池号补上；对不上的单列到 migrationIssues。
+        const schedules = await tx.table('schedules').toArray();
+        const observations = await tx.table('observations').toArray();
+        const ponds = await tx.table('ponds').toArray();
+        const pondCodeById = new Map<string, string>(ponds.map((p: Pond) => [p.id, p.code]));
+
+        // 迁移 1：为每个出现在走水编排里的日期建一个默认白班
+        const shiftByDate = new Map<string, string>();
+        for (const row of schedules) {
+          const date = typeof row.planDate === 'string' ? row.planDate : '';
+          if (date === '' || shiftByDate.has(date)) continue;
+          const shiftId = uuid('shift');
+          shiftByDate.set(date, shiftId);
+          await tx.table('shifts').put({
+            id: shiftId,
+            date,
+            shiftType: '白班',
+            leader: '',
+            note: '升级时按走水编排日期自动建立',
+            createdAt: nowIso(),
+            updatedAt: nowIso(),
+            revision: ROW_REVISION,
+          });
+        }
+
+        // 迁移 2：走水编排补班次（按池号 + 日期对上对应班次）
+        const issues: MigrationIssue[] = [];
+        for (const row of schedules) {
+          if (typeof row.shiftId === 'string' && row.shiftId !== '') continue;
+          const date = typeof row.planDate === 'string' ? row.planDate : '';
+          const shiftId = date === '' ? undefined : shiftByDate.get(date);
+          if (shiftId === undefined) {
+            issues.push({
+              id: uuid('issue'),
+              kind: 'schedule',
+              rowId: row.id as string,
+              pondCode: pondCodeById.get(row.pondId as string) ?? '未知池号',
+              date,
+              reason: '走水编排日期找不到对应班次',
+              createdAt: nowIso(),
+            });
+            continue;
+          }
+          await tx.table('schedules').update(row.id as string, { shiftId });
+        }
+
+        // 迁移 3：卤水观测补班次（按池号 + 日期对上对应班次）
+        for (const row of observations) {
+          if (typeof row.shiftId === 'string' && row.shiftId !== '') continue;
+          const date = typeof row.date === 'string' ? row.date : '';
+          const shiftId = date === '' ? undefined : shiftByDate.get(date);
+          if (shiftId === undefined) {
+            issues.push({
+              id: uuid('issue'),
+              kind: 'observation',
+              rowId: row.id as string,
+              pondCode: pondCodeById.get(row.pondId as string) ?? '未知池号',
+              date,
+              reason: '观测日期找不到对应班次',
+              createdAt: nowIso(),
+            });
+            continue;
+          }
+          await tx.table('observations').update(row.id as string, { shiftId });
+        }
+
+        // 迁移 4：对不上的单列到 migrationIssues，供人工核对
+        if (issues.length > 0) {
+          await tx.table('migrationIssues').bulkPut(issues);
+        }
+      });
   }
 }
 
@@ -127,15 +222,17 @@ export async function putPond(row: Pond): Promise<void> {
   await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
 }
 
-/** 删除蒸发池，并级联清理相关闸门、观测、化验与走水计划 */
+/** 删除蒸发池，并级联清理相关闸门、观测、化验、走水计划、巡测单与卤罐 */
 export async function removePond(id: string): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.patrolSheets, db.tanks], async () => {
     const gates = await db.gates.toArray();
     const related = gates.filter((gate) => gate.fromPondId === id || gate.toPondId === id).map((gate) => gate.id);
     if (related.length > 0) await db.gates.bulkDelete(related);
     await db.observations.where('pondId').equals(id).delete();
     await db.assays.where('pondId').equals(id).delete();
     await db.schedules.where('pondId').equals(id).delete();
+    await db.patrolSheets.where('pondId').equals(id).delete();
+    await db.tanks.where('pondId').equals(id).delete();
     await db.ponds.delete(id);
   });
 }
@@ -274,6 +371,75 @@ export async function advanceScheduleState(scheduleId: string, next: ScheduleSta
   await db.schedules.update(scheduleId, { state: next, updatedAt: nowIso() });
 }
 
+/* -------------------------------- 班次 -------------------------------- */
+
+export async function listShifts(): Promise<Shift[]> {
+  const rows = await db.shifts.toArray();
+  return rows.sort((a, b) => a.date.localeCompare(b.date) || a.shiftType.localeCompare(b.shiftType));
+}
+
+export async function putShift(row: Shift): Promise<void> {
+  await db.shifts.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeShift(id: string): Promise<void> {
+  await db.shifts.delete(id);
+}
+
+/* ------------------------------ 巡测单 ------------------------------ */
+
+export async function listPatrolSheets(): Promise<PatrolSheet[]> {
+  const rows = await db.patrolSheets.toArray();
+  return rows.sort((a, b) => a.measuredAt.localeCompare(b.measuredAt));
+}
+
+export async function listPatrolSheetsByShift(shiftId: string): Promise<PatrolSheet[]> {
+  const rows = await db.patrolSheets.where('shiftId').equals(shiftId).toArray();
+  return rows.sort((a, b) => a.measuredAt.localeCompare(b.measuredAt));
+}
+
+/** 写入巡测单：同池同班仅保留一条（存在即覆盖原记录） */
+export async function upsertPatrolSheet(row: PatrolSheet): Promise<PatrolSheet> {
+  const existing = await db.patrolSheets.where('[pondId+shiftId]').equals([row.pondId, row.shiftId]).first();
+  const next: PatrolSheet = {
+    ...row,
+    id: existing === undefined ? row.id : existing.id,
+    createdAt: existing === undefined ? row.createdAt : existing.createdAt,
+    updatedAt: nowIso(),
+    revision: ROW_REVISION,
+  };
+  await db.patrolSheets.put(next);
+  return next;
+}
+
+export async function removePatrolSheet(id: string): Promise<void> {
+  await db.patrolSheets.delete(id);
+}
+
+/* ------------------------------ 成品卤罐 ------------------------------ */
+
+export async function listTanks(): Promise<FinishedBrineTank[]> {
+  return db.tanks.toArray();
+}
+
+export async function putTank(row: FinishedBrineTank): Promise<void> {
+  await db.tanks.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeTank(id: string): Promise<void> {
+  await db.tanks.delete(id);
+}
+
+/* --------------------------- 升级补班次问题 --------------------------- */
+
+export async function listMigrationIssues(): Promise<MigrationIssue[]> {
+  return db.migrationIssues.toArray();
+}
+
+export async function clearMigrationIssues(): Promise<void> {
+  await db.migrationIssues.clear();
+}
+
 /* ---------------------------- 整库快照 ---------------------------- */
 
 export interface DatabaseSnapshot {
@@ -285,56 +451,93 @@ export interface DatabaseSnapshot {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  shifts: Shift[];
+  patrolSheets: PatrolSheet[];
+  tanks: FinishedBrineTank[];
+  migrationIssues: MigrationIssue[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, shifts, patrolSheets, tanks, migrationIssues] = await Promise.all([
     db.ponds.toArray(),
     db.gates.toArray(),
     db.observations.toArray(),
     db.assays.toArray(),
     db.schedules.toArray(),
+    db.shifts.toArray(),
+    db.patrolSheets.toArray(),
+    db.tanks.toArray(),
+    db.migrationIssues.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), ponds, gates, observations, assays, schedules };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    ponds,
+    gates,
+    observations,
+    assays,
+    schedules,
+    shifts,
+    patrolSheets,
+    tanks,
+    migrationIssues,
+  };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shifts, db.patrolSheets, db.tanks, db.migrationIssues], async () => {
     await Promise.all([
       db.ponds.clear(),
       db.gates.clear(),
       db.observations.clear(),
       db.assays.clear(),
       db.schedules.clear(),
+      db.shifts.clear(),
+      db.patrolSheets.clear(),
+      db.tanks.clear(),
+      db.migrationIssues.clear(),
     ]);
     await db.ponds.bulkPut(snapshot.ponds.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.gates.bulkPut(snapshot.gates.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.schedules.bulkPut(snapshot.schedules.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.shifts.bulkPut(snapshot.shifts.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.patrolSheets.bulkPut(snapshot.patrolSheets.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.tanks.bulkPut(snapshot.tanks.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.migrationIssues.bulkPut(snapshot.migrationIssues.map((row) => ({ ...row, revision: ROW_REVISION })));
   });
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shifts, db.patrolSheets, db.tanks, db.migrationIssues], async () => {
     await Promise.all([
       db.ponds.clear(),
       db.gates.clear(),
       db.observations.clear(),
       db.assays.clear(),
       db.schedules.clear(),
+      db.shifts.clear(),
+      db.patrolSheets.clear(),
+      db.tanks.clear(),
+      db.migrationIssues.clear(),
     ]);
   });
   await seedDatabase();
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, shifts, patrolSheets, tanks, migrationIssues] = await Promise.all([
     db.ponds.count(),
     db.gates.count(),
     db.observations.count(),
     db.assays.count(),
     db.schedules.count(),
+    db.shifts.count(),
+    db.patrolSheets.count(),
+    db.tanks.count(),
+    db.migrationIssues.count(),
   ]);
-  return { ponds, gates, observations, assays, schedules };
+  return { ponds, gates, observations, assays, schedules, shifts, patrolSheets, tanks, migrationIssues };
 }

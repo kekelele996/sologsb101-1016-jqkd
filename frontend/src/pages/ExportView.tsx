@@ -29,6 +29,10 @@ export default function ExportView() {
     const observations = store.state.observations;
     const assays = store.state.assays;
     const schedules = store.state.schedules;
+    const patrolSheets = store.state.patrolSheets;
+    const shifts = store.state.shifts;
+    const tanks = store.state.tanks;
+    const migrationIssues = store.state.migrationIssues;
     const passCount = assays.filter((row) => effectiveVerdict(row) === '达标').length;
     const done = schedules.filter((row) => row.state === '已出卤').length;
     const readyPonds = new Set(assays.filter((row) => effectiveVerdict(row) === '达标').map((row) => row.pondId)).size;
@@ -38,6 +42,10 @@ export default function ExportView() {
       assays: assays.length,
       gates: store.state.gates.length,
       schedules: schedules.length,
+      patrolSheets: patrolSheets.length,
+      shifts: shifts.length,
+      tanks: tanks.length,
+      migrationIssues: migrationIssues.length,
       passCount,
       passPct: assays.length === 0 ? 0 : Math.round((passCount / assays.length) * 1000) / 10,
       donePct: schedules.length === 0 ? 0 : Math.round((done / schedules.length) * 1000) / 10,
@@ -108,12 +116,18 @@ export default function ExportView() {
         />
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
+        <StatBadge label="班次" value={summary().shifts} suffix="班" tone="info" />
+        <StatBadge label="巡测单" value={summary().patrolSheets} suffix="条" tone="info" />
+        <StatBadge label="成品卤罐" value={summary().tanks} suffix="个" tone="default" />
+        <Show when={summary().migrationIssues > 0}>
+          <StatBadge label="补班次对不上" value={summary().migrationIssues} suffix="条" tone="danger" />
+        </Show>
         <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录，v3 新增班次/巡测单/卤罐并按池号补班次"
         />
       </div>
 

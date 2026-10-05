@@ -1,6 +1,7 @@
 /**
  * 演示数据播种（幂等）
  * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排
+ * v3 新增：班次 / 巡测单 / 成品卤罐，走水编排按班次与巡测单对账。
  * 所有 id 固定，保证 /gates、/observations、/assays、/schedules 打开就有真实串级与数据。
  */
 import { db, ROW_REVISION } from './db';
@@ -9,6 +10,9 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { Shift } from '../types/shift';
+import type { PatrolSheet } from '../types/patrolSheet';
+import type { FinishedBrineTank } from '../types/tank';
 import { autoVerdict, estimateEvapMm } from './brine';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
@@ -128,20 +132,48 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
-  const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+  // ---------------- 班次（3 个白班，覆盖走水编排的计划日期） ----------------
+  const shifts: Shift[] = [
+    wrap<Shift>({ id: 'shift-0928', date: '2026-09-28', shiftType: '白班', leader: '韩江', note: '' }),
+    wrap<Shift>({ id: 'shift-0929', date: '2026-09-29', shiftType: '白班', leader: '王锐', note: '' }),
+    wrap<Shift>({ id: 'shift-0930', date: '2026-09-30', shiftType: '白班', leader: '韩江', note: '' }),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  // ---------------- 巡测单（按池号 + 班次对账，部分池未到指标先挂着） ----------------
+  const patrolSheets: PatrolSheet[] = [
+    // 2026-09-28 白班：北-01 已到指标，南-04 未到指标（挂着）
+    wrap<PatrolSheet>({ id: 'patrol-a-0928', pondId: SEED_IDS.pondA, shiftId: 'shift-0928', densityGcm3: 1.118, levelCm: 42, windLevel: 2, measuredAt: '2026-09-28T09:15', note: '密度已到目标，可排' }),
+    wrap<PatrolSheet>({ id: 'patrol-d-0928', pondId: SEED_IDS.pondD, shiftId: 'shift-0928', densityGcm3: 1.092, levelCm: 45, windLevel: 3, measuredAt: '2026-09-28T09:30', note: '密度未到目标，先挂着' }),
+    // 2026-09-29 白班：北-02 已到指标
+    wrap<PatrolSheet>({ id: 'patrol-b-0929', pondId: SEED_IDS.pondB, shiftId: 'shift-0929', densityGcm3: 1.178, levelCm: 38, windLevel: 2, measuredAt: '2026-09-29T09:20', note: '' }),
+    // 2026-09-30 白班：北-03 已到指标，南-05 未到指标
+    wrap<PatrolSheet>({ id: 'patrol-c-0930', pondId: SEED_IDS.pondC, shiftId: 'shift-0930', densityGcm3: 1.258, levelCm: 30, windLevel: 1, measuredAt: '2026-09-30T09:10', note: '' }),
+    wrap<PatrolSheet>({ id: 'patrol-e-0930', pondId: SEED_IDS.pondE, shiftId: 'shift-0930', densityGcm3: 1.142, levelCm: 35, windLevel: 2, measuredAt: '2026-09-30T09:40', note: '密度未到目标，先挂着' }),
+  ];
+
+  // ---------------- 成品卤罐（1 个正常液位 + 1 个满罐，满罐时走水排队到下一班） ----------------
+  const tanks: FinishedBrineTank[] = [
+    wrap<FinishedBrineTank>({ id: 'tank-north', code: '北成品罐', capacityM3: 5000, currentLevelM3: 3200, status: '正常', pondId: null, note: '北部一系共用成品卤罐' }),
+    wrap<FinishedBrineTank>({ id: 'tank-south', code: '南成品罐', capacityM3: 3000, currentLevelM3: 3000, status: '满', pondId: null, note: '南部二系成品卤罐已满，走水排队到下一班' }),
+  ];
+
+  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后，按班次对账） ----------------
+  const schedules: Schedule[] = [
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, shiftId: 'shift-0928', planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, shiftId: 'shift-0928', planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, shiftId: 'shift-0929', planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, shiftId: 'shift-0930', planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, shiftId: 'shift-0930', planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+  ];
+
+  await db.transaction('rw', [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.shifts, db.patrolSheets, db.tanks], async () => {
     await db.ponds.bulkPut(ponds);
     await db.gates.bulkPut(gates);
     await db.observations.bulkPut(observations);
     await db.assays.bulkPut(assays);
     await db.schedules.bulkPut(schedules);
+    await db.shifts.bulkPut(shifts);
+    await db.patrolSheets.bulkPut(patrolSheets);
+    await db.tanks.bulkPut(tanks);
   });
 }

@@ -10,6 +10,10 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { Shift } from '../types/shift';
+import type { PatrolSheet } from '../types/patrolSheet';
+import type { FinishedBrineTank } from '../types/tank';
+import type { MigrationIssue } from '../types/migrationIssue';
 import { DB_SCHEMA_VERSION, ROW_REVISION, countAll, db, initDatabase, putPond, removePond } from '../utils/db';
 import { effectiveVerdict, pondVolumeM3 } from '../utils/brine';
 import { nowIso, uuid } from '../utils/id';
@@ -45,6 +49,10 @@ interface PondState {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  shifts: Shift[];
+  patrolSheets: PatrolSheet[];
+  tanks: FinishedBrineTank[];
+  migrationIssues: MigrationIssue[];
   currentSeries: string | null;
   loading: boolean;
   ready: boolean;
@@ -78,6 +86,10 @@ function createPondStore() {
     observations: [],
     assays: [],
     schedules: [],
+    shifts: [],
+    patrolSheets: [],
+    tanks: [],
+    migrationIssues: [],
     currentSeries: readSeries(),
     loading: true,
     ready: false,
@@ -100,16 +112,20 @@ function createPondStore() {
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [ponds, gates, observations, assays, schedules] = await Promise.all([
+          const [ponds, gates, observations, assays, schedules, shifts, patrolSheets, tanks, migrationIssues] = await Promise.all([
             db.ponds.toArray(),
             db.gates.toArray(),
             db.observations.toArray(),
             db.assays.toArray(),
             db.schedules.toArray(),
+            db.shifts.toArray(),
+            db.patrolSheets.toArray(),
+            db.tanks.toArray(),
+            db.migrationIssues.toArray(),
           ]);
-          return { ponds, gates, observations, assays, schedules };
+          return { ponds, gates, observations, assays, schedules, shifts, patrolSheets, tanks, migrationIssues };
         }).subscribe({
-          next: ({ ponds, gates, observations, assays, schedules }) => {
+          next: ({ ponds, gates, observations, assays, schedules, shifts, patrolSheets, tanks, migrationIssues }) => {
             const sorted = [...ponds].sort(
               (a, b) => a.seriesName.localeCompare(b.seriesName, 'zh-Hans-CN') || a.code.localeCompare(b.code),
             );
@@ -119,6 +135,10 @@ function createPondStore() {
               observations: [...observations].sort((a, b) => a.date.localeCompare(b.date)),
               assays: [...assays].sort((a, b) => a.date.localeCompare(b.date)),
               schedules: [...schedules].sort((a, b) => a.orderIndex - b.orderIndex),
+              shifts: [...shifts].sort((a, b) => a.date.localeCompare(b.date) || a.shiftType.localeCompare(b.shiftType)),
+              patrolSheets: [...patrolSheets].sort((a, b) => b.measuredAt.localeCompare(a.measuredAt)),
+              tanks: [...tanks].sort((a, b) => a.code.localeCompare(b.code)),
+              migrationIssues: [...migrationIssues].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
               loading: false,
               ready: true,
               error: '',

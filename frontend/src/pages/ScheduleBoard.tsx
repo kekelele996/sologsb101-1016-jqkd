@@ -1,7 +1,8 @@
 /**
  * /schedules 走水与出卤编排
  * 按日期排序、拖拽调整走水先后顺序、逐条推进状态；出卤完成回写池阶段与实际密度。
- * 消费模型：Schedule、Gate、Assay；复用组件：<FilterBar>、<EmptyPanel>、<StatBadge>
+ * 走水编排单按班次与巡测单对账，还没到指标的池先挂着不排；成品卤罐满时排队到下一班。
+ * 消费模型：Schedule、Gate、Assay、Shift、PatrolSheet、Tank；复用组件：<FilterBar>、<EmptyPanel>、<StatBadge>
  */
 import { For, Show, createMemo, createSignal, onMount } from 'solid-js';
 import { createStore } from 'solid-js/store';
@@ -12,8 +13,13 @@ import StatBadge from '../components/common/StatBadge';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
 import { useScheduleStore } from '../stores/scheduleStore';
+import { useShiftStore } from '../stores/shiftStore';
+import { useTankStore } from '../stores/tankStore';
 import { SCHEDULE_STATE_OPTIONS, type Schedule, type ScheduleDraft, type ScheduleState } from '../types/schedule';
+import { shiftLabel } from '../types/shift';
 import { effectiveVerdict } from '../utils/brine';
+import { isHeld, isMissingSheet, reconcileByPondAndShift } from '../utils/reconcile';
+import { checkQueue } from '../utils/queue';
 import { today } from '../utils/id';
 
 const INPUT =
@@ -31,9 +37,10 @@ const STATE_STYLE: Record<ScheduleState, string> = {
   已出卤: 'border-emerald-300 bg-emerald-50 text-emerald-700',
 };
 
-function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
+function emptyDraft(pondId: string, shiftId: string, orderIndex: number): ScheduleDraft {
   return {
     pondId,
+    shiftId,
     planDate: today(),
     targetDensity: 1.15,
     volumeM3: 800,
@@ -46,12 +53,14 @@ function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
 export default function ScheduleBoard() {
   const pondStore = usePondStore();
   const scheduleStore = useScheduleStore();
+  const shiftStore = useShiftStore();
+  const tankStore = useTankStore();
 
   const [dialogOpen, setDialogOpen] = createSignal(false);
   const [editingId, setEditingId] = createSignal<string | null>(null);
   const [deleting, setDeleting] = createSignal<Schedule | null>(null);
   const [dragOverId, setDragOverId] = createSignal<string | null>(null);
-  const [draft, setDraft] = createStore<ScheduleDraft>(emptyDraft('', 1));
+  const [draft, setDraft] = createStore<ScheduleDraft>(emptyDraft('', '', 1));
 
   onMount(() => {
     void pondStore.loadAll();
@@ -98,8 +107,9 @@ export default function ScheduleBoard() {
 
   const openCreate = (): void => {
     const pondId = pondStore.pondsOfSeries(pondStore.state.currentSeries)[0]?.id ?? pondStore.state.ponds[0]?.id ?? '';
+    const shiftId = shiftStore.state.rows[0]?.id ?? '';
     setEditingId(null);
-    setDraft(emptyDraft(pondId, ordered().length + 1));
+    setDraft(emptyDraft(pondId, shiftId, ordered().length + 1));
     setDialogOpen(true);
   };
 
@@ -107,6 +117,7 @@ export default function ScheduleBoard() {
     setEditingId(row.id);
     setDraft({
       pondId: row.pondId,
+      shiftId: row.shiftId,
       planDate: row.planDate,
       targetDensity: row.targetDensity,
       volumeM3: row.volumeM3,
@@ -268,6 +279,39 @@ export default function ScheduleBoard() {
                       </span>
                     </p>
                   </div>
+                  <div class="text-xs text-slate-600">
+                    <p class="mb-0.5">对账状态</p>
+                    {(() => {
+                      const result = reconcileByPondAndShift(row.pondId, row.shiftId, pondStore.state.patrolSheets, pondStore.state.schedules);
+                      if (result.matched) {
+                        return <span class="rounded border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700">已到指标</span>;
+                      }
+                      if (isHeld(result)) {
+                        return <span class="rounded border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] text-amber-700" title={result.reason}>挂着未排</span>;
+                      }
+                      if (isMissingSheet(result)) {
+                        return <span class="rounded border border-rose-300 bg-rose-50 px-2 py-0.5 text-[11px] text-rose-700">缺巡测单</span>;
+                      }
+                      return <span class="text-slate-400">—</span>;
+                    })()}
+                  </div>
+                  <div class="text-xs text-slate-600">
+                    <p class="mb-0.5">排队状态</p>
+                    {(() => {
+                      const shift = shiftStore.state.rows.find((item) => item.id === row.shiftId);
+                      if (shift === undefined) return <span class="text-slate-400">—</span>;
+                      const tank = tankStore.state.rows.find((item) => item.pondId === row.pondId) ?? tankStore.state.rows[0];
+                      const queue = checkQueue(tank, shift, shiftStore.state.rows);
+                      if (queue.queued) {
+                        return (
+                          <span class="rounded border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] text-amber-700" title={queue.reason}>
+                            排队到 {queue.targetShift === null ? '下一班' : shiftLabel(queue.targetShift)}
+                          </span>
+                        );
+                      }
+                      return <span class="rounded border border-sky-300 bg-sky-50 px-2 py-0.5 text-[11px] text-sky-700">本班排</span>;
+                    })()}
+                  </div>
                   <span class={`rounded border px-2 py-0.5 text-[11px] ${STATE_STYLE[row.state]}`}>{row.state}</span>
                   <div class="flex flex-wrap items-center gap-2">
                     <button
@@ -329,6 +373,15 @@ export default function ScheduleBoard() {
                     {pond.code} · {pond.seriesName} · {pond.stage}
                   </option>
                 )}
+              </For>
+            </select>
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>班次（按池号和班次对账）</span>
+            <select class={INPUT} value={draft.shiftId} onChange={(event) => setDraft('shiftId', event.currentTarget.value)}>
+              <option value="">请选择</option>
+              <For each={shiftStore.state.rows}>
+                {(shift) => <option value={shift.id}>{shiftLabel(shift)}</option>}
               </For>
             </select>
           </label>
